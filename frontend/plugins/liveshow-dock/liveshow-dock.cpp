@@ -2,6 +2,10 @@
 #include <obs-frontend-api.h>
 #include <browser-panel.hpp>
 
+#include <QDockWidget>
+#include <QMainWindow>
+#include <QString>
+
 #include <cstdlib>
 #include <string>
 
@@ -106,6 +110,19 @@ void CreateDock()
 	if (!obs_frontend_add_dock_by_id(kDockId, kDockTitle, dockWidget)) {
 		blog(LOG_WARNING, "[liveshow-dock] failed to register dock (duplicate id?)");
 		return;
+	}
+
+	// obs_frontend_add_dock_by_id() always registers the dock hidden and floating
+	// (frontend/OBSStudioAPI.cpp: `dock->setVisible(false); dock->setFloating(true);`)
+	// — that's the public API's own behavior, not something the caller can pass a flag
+	// for. Reach back into the Qt tree via the main window and force it visible/docked
+	// so it actually shows up on first launch, matching this screen's "visible by
+	// default" requirement instead of requiring the user to dig it out of the Docks menu.
+	if (QMainWindow *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window())) {
+		if (QDockWidget *dock = mainWindow->findChild<QDockWidget *>(QString::fromUtf8(kDockId))) {
+			dock->setFloating(false);
+			dock->setVisible(true);
+		}
 	}
 
 	blog(LOG_INFO, "[liveshow-dock] dock created at %s", url.c_str());
