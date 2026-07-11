@@ -9,6 +9,7 @@
 #include <QString>
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 OBS_DECLARE_MODULE()
@@ -145,8 +146,17 @@ void CreateDock()
 // Reads are missing-safe: obs_data_get_string returns "" for an absent key, so a plugin
 // with no prior SetActiveStream call yields an empty {} response rather than an error —
 // the dock's own logic distinguishes "no selection yet" that way.
-void HandleGetActiveStream(obs_data_t *, obs_data_t *response, void *)
+//
+// The stored file only ever tracks the single most recent selection (still just one
+// active-context.json), but it's now tagged with the userId that made it. A different
+// user asking for the active stream must see "no selection yet", not someone else's
+// event/stream (and, transitively, not risk a 403 fetching an event they don't own).
+void HandleGetActiveStream(obs_data_t *request, obs_data_t *response, void *)
 {
+	const char *requestUserId = obs_data_get_string(request, "userId");
+	if (!requestUserId || !*requestUserId)
+		return;
+
 	char *path = obs_module_config_path(kActiveContextConfigFile);
 	if (!path)
 		return;
@@ -156,9 +166,11 @@ void HandleGetActiveStream(obs_data_t *, obs_data_t *response, void *)
 	if (!stored)
 		return;
 
+	const char *storedUserId = obs_data_get_string(stored, "userId");
 	const char *eventId = obs_data_get_string(stored, "eventId");
 	const char *streamId = obs_data_get_string(stored, "streamId");
-	if (eventId && *eventId && streamId && *streamId) {
+	if (storedUserId && *storedUserId && strcmp(storedUserId, requestUserId) == 0 && eventId && *eventId &&
+	    streamId && *streamId) {
 		obs_data_set_string(response, "eventId", eventId);
 		obs_data_set_string(response, "streamId", streamId);
 	}
@@ -167,10 +179,12 @@ void HandleGetActiveStream(obs_data_t *, obs_data_t *response, void *)
 
 void HandleSetActiveStream(obs_data_t *request, obs_data_t *response, void *)
 {
+	const char *userId = obs_data_get_string(request, "userId");
 	const char *eventId = obs_data_get_string(request, "eventId");
 	const char *streamId = obs_data_get_string(request, "streamId");
 
 	obs_data_t *toSave = obs_data_create();
+	obs_data_set_string(toSave, "userId", userId);
 	obs_data_set_string(toSave, "eventId", eventId);
 	obs_data_set_string(toSave, "streamId", streamId);
 
@@ -181,6 +195,7 @@ void HandleSetActiveStream(obs_data_t *request, obs_data_t *response, void *)
 	}
 	obs_data_release(toSave);
 
+	obs_data_set_string(response, "userId", userId);
 	obs_data_set_string(response, "eventId", eventId);
 	obs_data_set_string(response, "streamId", streamId);
 }
