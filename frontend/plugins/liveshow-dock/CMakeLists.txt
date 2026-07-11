@@ -7,6 +7,8 @@ add_library(OBS::liveshow-dock ALIAS liveshow-dock)
 
 target_sources(liveshow-dock PRIVATE liveshow-dock.cpp)
 
+target_include_directories(liveshow-dock PRIVATE ${CMAKE_SOURCE_DIR}/plugins/obs-websocket/lib)
+
 target_link_libraries(
   liveshow-dock
   PRIVATE

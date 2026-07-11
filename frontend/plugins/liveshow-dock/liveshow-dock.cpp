@@ -1,6 +1,8 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <browser-panel.hpp>
+#include <obs-websocket-api.h>
+#include <util/platform.h>
 
 #include <QDockWidget>
 #include <QMainWindow>
@@ -18,8 +20,11 @@ constexpr const char *kDockId = "liveshow-broadcaster-dock";
 constexpr const char *kDockTitle = "LiveShow Broadcaster";
 constexpr const char *kDefaultBaseUrl = "http://localhost:3000";
 constexpr const char *kObsWebsocketConfigFile = "config.json";
+constexpr const char *kVendorName = "liveshow";
+constexpr const char *kActiveContextConfigFile = "active-context.json";
 
 QCefWidget *dockWidget = nullptr;
+obs_websocket_vendor vendor = nullptr;
 
 std::string EnvOrDefault(const char *name, const char *fallback)
 {
@@ -135,6 +140,76 @@ void CreateDock()
 	blog(LOG_INFO, "[liveshow-dock] dock created at %s", url.c_str());
 }
 
+// obs-websocket vendor request callback signature: (request_data, response_data, priv_data).
+// The caller (obs-websocket's RequestHandler) allocates response_data; we only fill it in.
+// Reads are missing-safe: obs_data_get_string returns "" for an absent key, so a plugin
+// with no prior SetActiveStream call yields an empty {} response rather than an error —
+// the dock's own logic distinguishes "no selection yet" that way.
+void HandleGetActiveStream(obs_data_t *, obs_data_t *response, void *)
+{
+	char *path = obs_module_config_path(kActiveContextConfigFile);
+	if (!path)
+		return;
+
+	obs_data_t *stored = obs_data_create_from_json_file(path);
+	bfree(path);
+	if (!stored)
+		return;
+
+	const char *eventId = obs_data_get_string(stored, "eventId");
+	const char *streamId = obs_data_get_string(stored, "streamId");
+	if (eventId && *eventId && streamId && *streamId) {
+		obs_data_set_string(response, "eventId", eventId);
+		obs_data_set_string(response, "streamId", streamId);
+	}
+	obs_data_release(stored);
+}
+
+void HandleSetActiveStream(obs_data_t *request, obs_data_t *response, void *)
+{
+	const char *eventId = obs_data_get_string(request, "eventId");
+	const char *streamId = obs_data_get_string(request, "streamId");
+
+	obs_data_t *toSave = obs_data_create();
+	obs_data_set_string(toSave, "eventId", eventId);
+	obs_data_set_string(toSave, "streamId", streamId);
+
+	char *path = obs_module_config_path(kActiveContextConfigFile);
+	if (path) {
+		obs_data_save_json_safe(toSave, path, "tmp", "bak");
+		bfree(path);
+	}
+	obs_data_release(toSave);
+
+	obs_data_set_string(response, "eventId", eventId);
+	obs_data_set_string(response, "streamId", streamId);
+}
+
+// Per obs-websocket-api.h: "ALWAYS CALL ONLY VIA obs_module_post_load() CALLBACK!" — same
+// lifecycle CreateDock() already relies on, since obs-websocket's own obs_module_load()
+// (which sets up the proc handler this all rides on) is guaranteed to have run by then.
+void RegisterVendorRequests()
+{
+	// obs_module_config_path() only builds the path string, it doesn't create the
+	// directory — unlike obs-websocket's own config dir (already created by its own
+	// first settings save), this plugin's config dir doesn't exist yet on a fresh
+	// install, so the first obs_data_save_json_safe() would silently fail without this.
+	char *configDir = obs_module_config_path("");
+	if (configDir) {
+		os_mkdirs(configDir);
+		bfree(configDir);
+	}
+
+	vendor = obs_websocket_register_vendor(kVendorName);
+	if (!vendor) {
+		blog(LOG_WARNING, "[liveshow-dock] obs-websocket vendor registration failed (obs-websocket not loaded?)");
+		return;
+	}
+
+	obs_websocket_vendor_register_request(vendor, "GetActiveStream", HandleGetActiveStream, nullptr);
+	obs_websocket_vendor_register_request(vendor, "SetActiveStream", HandleSetActiveStream, nullptr);
+}
+
 } // namespace
 
 bool obs_module_load(void)
@@ -147,4 +222,5 @@ void obs_module_unload(void) {}
 void obs_module_post_load(void)
 {
 	CreateDock();
+	RegisterVendorRequests();
 }
