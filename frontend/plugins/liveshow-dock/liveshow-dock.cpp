@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 
 OBS_DECLARE_MODULE()
@@ -23,9 +24,11 @@ constexpr const char *kDefaultBaseUrl = "http://localhost:3000";
 constexpr const char *kObsWebsocketConfigFile = "config.json";
 constexpr const char *kVendorName = "liveshow";
 constexpr const char *kActiveContextConfigFile = "active-context.json";
+constexpr const char *kCameraCanvasNamePrefix = "liveshow-camera-";
 
 QCefWidget *dockWidget = nullptr;
 obs_websocket_vendor vendor = nullptr;
+std::map<std::string, obs_canvas_t *> cameraCanvases;
 
 std::string EnvOrDefault(const char *name, const char *fallback)
 {
@@ -200,6 +203,72 @@ void HandleSetActiveStream(obs_data_t *request, obs_data_t *response, void *)
 	obs_data_set_string(response, "streamId", streamId);
 }
 
+std::string CameraCanvasName(const std::string &cameraId)
+{
+	return std::string(kCameraCanvasNamePrefix) + cameraId;
+}
+
+// See this plan's Global Constraints: obs_canvas_create() returns a canvas
+// with its weak-ref zero-initialized, and OBS's internal name/uuid lookup
+// tables store raw pointers with no addref — being findable by name does not
+// keep the object alive. This plugin holds the strong ref itself in
+// cameraCanvases for as long as the canvas should exist, releasing only in
+// HandleRemoveCameraCanvas.
+void HandleCreateCameraCanvas(obs_data_t *request, obs_data_t *response, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	if (!cameraId || !*cameraId)
+		return;
+
+	std::string id(cameraId);
+	auto it = cameraCanvases.find(id);
+	if (it != cameraCanvases.end()) {
+		obs_data_set_string(response, "canvasName", obs_canvas_get_name(it->second));
+		return;
+	}
+
+	struct obs_video_info ovi;
+	if (!obs_get_video_info(&ovi)) {
+		blog(LOG_WARNING, "[liveshow-dock] obs_get_video_info failed, cannot create canvas for camera %s", cameraId);
+		return;
+	}
+
+	std::string name = CameraCanvasName(id);
+	obs_canvas_t *canvas = obs_canvas_create(name.c_str(), &ovi, 0);
+	if (!canvas) {
+		blog(LOG_WARNING, "[liveshow-dock] obs_canvas_create failed for camera %s", cameraId);
+		return;
+	}
+
+	cameraCanvases[id] = canvas;
+	obs_data_set_string(response, "canvasName", name.c_str());
+}
+
+void HandleRemoveCameraCanvas(obs_data_t *request, obs_data_t *, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	if (!cameraId || !*cameraId)
+		return;
+
+	auto it = cameraCanvases.find(cameraId);
+	if (it == cameraCanvases.end())
+		return;
+
+	// obs_canvas_remove() only marks the canvas removed and fires a signal — it's
+	// internally ref-neutral (get_ref then release, self-balanced). The plugin's
+	// own release() is what actually drops the held ref and triggers destruction.
+	obs_canvas_remove(it->second);
+	obs_canvas_release(it->second);
+	cameraCanvases.erase(it);
+}
+
+void HandleGetCameraCanvasStatus(obs_data_t *request, obs_data_t *response, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	bool exists = cameraId && *cameraId && cameraCanvases.count(cameraId) > 0;
+	obs_data_set_bool(response, "exists", exists);
+}
+
 // Per obs-websocket-api.h: "ALWAYS CALL ONLY VIA obs_module_post_load() CALLBACK!" — same
 // lifecycle CreateDock() already relies on, since obs-websocket's own obs_module_load()
 // (which sets up the proc handler this all rides on) is guaranteed to have run by then.
@@ -223,6 +292,9 @@ void RegisterVendorRequests()
 
 	obs_websocket_vendor_register_request(vendor, "GetActiveStream", HandleGetActiveStream, nullptr);
 	obs_websocket_vendor_register_request(vendor, "SetActiveStream", HandleSetActiveStream, nullptr);
+	obs_websocket_vendor_register_request(vendor, "CreateCameraCanvas", HandleCreateCameraCanvas, nullptr);
+	obs_websocket_vendor_register_request(vendor, "RemoveCameraCanvas", HandleRemoveCameraCanvas, nullptr);
+	obs_websocket_vendor_register_request(vendor, "GetCameraCanvasStatus", HandleGetCameraCanvasStatus, nullptr);
 }
 
 } // namespace
