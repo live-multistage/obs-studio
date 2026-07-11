@@ -49,7 +49,7 @@ std::string ReadObsWebsocketPassword()
 		return std::string();
 	}
 
-	std::string password = obs_data_get_string(data, "ServerPassword");
+	std::string password = obs_data_get_string(data, "server_password");
 	obs_data_release(data);
 	return password;
 }
