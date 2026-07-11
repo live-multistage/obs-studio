@@ -58,8 +58,13 @@ std::string ReadObsWebsocketPassword()
 	return password;
 }
 
-// Builds `window.dispatchEvent(new CustomEvent('liveshow-obs-credentials', { detail: {...} }))`
-// with the password JSON-escaped via obs_data's own serializer (never hand-concatenate
+// setStartupScript runs in CEF's OnLoadEnd (main frame load complete), which fires
+// before the page's own JS has had a chance to attach a 'liveshow-obs-credentials'
+// listener (e.g. a React useEffect that runs post-hydration). A bare dispatchEvent()
+// is lost in that case — nothing was listening yet. Stash the payload on window as a
+// durable value the page can read on its own schedule, and also dispatch the event as
+// a fallback for the (unlikely) case a listener is already attached when this runs.
+// The password is JSON-escaped via obs_data's own serializer (never hand-concatenate
 // the raw password into a JS string literal — a password containing a quote or
 // backslash would break the script or, worse, allow injection).
 std::string BuildCredentialsScript(const std::string &password)
@@ -68,7 +73,9 @@ std::string BuildCredentialsScript(const std::string &password)
 	obs_data_set_string(payload, "password", password.c_str());
 	const char *payloadJson = obs_data_get_json(payload);
 
-	std::string script = "window.dispatchEvent(new CustomEvent('liveshow-obs-credentials', { detail: ";
+	std::string script = "window.liveshowObsCredentials = ";
+	script += payloadJson;
+	script += "; window.dispatchEvent(new CustomEvent('liveshow-obs-credentials', { detail: ";
 	script += payloadJson;
 	script += " }));";
 
