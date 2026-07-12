@@ -26,6 +26,21 @@ constexpr const char *kObsWebsocketConfigFile = "config.json";
 constexpr const char *kVendorName = "liveshow";
 constexpr const char *kActiveContextConfigFile = "active-context.json";
 constexpr const char *kCameraCanvasNamePrefix = "liveshow-camera-";
+constexpr const char *kCameraSourcePrefix = "liveshow-capture-";
+constexpr const char *kCameraSceneName = "scene";
+
+#if defined(__APPLE__)
+constexpr const char *kCameraCaptureSourceId = "macos-avcapture";
+constexpr const char *kScreenCaptureSourceId = "display_capture";
+#elif defined(_WIN32)
+constexpr const char *kCameraCaptureSourceId = "dshow_input";
+constexpr const char *kScreenCaptureSourceId = "monitor_capture";
+#elif defined(__linux__)
+constexpr const char *kCameraCaptureSourceId = "v4l2_input";
+constexpr const char *kScreenCaptureSourceId = "pipewire-screen-capture-source";
+#else
+#error "Unsupported platform for liveshow-dock capture sources"
+#endif
 
 QCefWidget *dockWidget = nullptr;
 obs_websocket_vendor vendor = nullptr;
@@ -210,6 +225,11 @@ std::string CameraCanvasName(const std::string &cameraId)
 	return std::string(kCameraCanvasNamePrefix) + cameraId;
 }
 
+std::string CameraSourceName(const std::string &cameraId)
+{
+	return std::string(kCameraSourcePrefix) + cameraId;
+}
+
 // See this plan's Global Constraints: obs_canvas_create() returns a canvas
 // with its weak-ref zero-initialized, and OBS's internal name/uuid lookup
 // tables store raw pointers with no addref — being findable by name does not
@@ -277,6 +297,135 @@ void HandleGetCameraCanvasStatus(obs_data_t *request, obs_data_t *response, void
 	obs_data_set_bool(response, "exists", exists);
 }
 
+// Ref-counting note (opposite of the bare-canvas case above, verified against
+// obs-scene.c/obs-canvas.c): obs_scene_add() and obs_canvas_set_channel() both
+// call obs_source_get_ref() on what's handed to them, so the container takes
+// its own ownership. Standard pattern applies here: create your own ref, add
+// it to a container that addrefs, release your own ref right after.
+void HandleAttachCameraSource(obs_data_t *request, obs_data_t *response, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	const char *sourceType = obs_data_get_string(request, "sourceType");
+	if (!cameraId || !*cameraId || !sourceType || !*sourceType)
+		return;
+
+	const char *sourceId = nullptr;
+	if (strcmp(sourceType, "camera") == 0)
+		sourceId = kCameraCaptureSourceId;
+	else if (strcmp(sourceType, "screen") == 0)
+		sourceId = kScreenCaptureSourceId;
+	else
+		return;
+
+	obs_canvas_t *canvas = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+		auto it = cameraCanvases.find(cameraId);
+		if (it == cameraCanvases.end()) {
+			blog(LOG_WARNING, "[liveshow-dock] AttachCameraSource: no canvas for camera %s", cameraId);
+			return;
+		}
+		canvas = it->second;
+	}
+
+	// Replace whatever scene/source was previously attached, if any. Clearing
+	// the channel first releases the channel's own held ref (confirmed in
+	// obs_canvas_set_channel's implementation: it releases prev_source when
+	// replacing); obs_source_remove()+release() below then drops our lookup
+	// ref, and standard scene teardown releases its contained scene item's
+	// source ref as part of normal destruction.
+	obs_scene_t *existingScene = obs_canvas_get_scene_by_name(canvas, kCameraSceneName);
+	if (existingScene) {
+		obs_canvas_set_channel(canvas, 0, nullptr);
+		obs_source_t *existingSceneSource = obs_scene_get_source(existingScene);
+		obs_source_remove(existingSceneSource);
+		obs_source_release(existingSceneSource);
+	}
+
+	std::string sourceName = CameraSourceName(cameraId);
+	obs_source_t *source = obs_source_create(sourceId, sourceName.c_str(), nullptr, nullptr);
+	if (!source) {
+		blog(LOG_WARNING, "[liveshow-dock] obs_source_create(%s) failed for camera %s", sourceId, cameraId);
+		return;
+	}
+
+	obs_scene_t *scene = obs_canvas_scene_create(canvas, kCameraSceneName);
+	if (!scene) {
+		blog(LOG_WARNING, "[liveshow-dock] obs_canvas_scene_create failed for camera %s", cameraId);
+		obs_source_release(source);
+		return;
+	}
+
+	obs_scene_add(scene, source);
+	obs_source_release(source);
+
+	obs_source_t *sceneSource = obs_scene_get_source(scene);
+	obs_canvas_set_channel(canvas, 0, sceneSource);
+	obs_source_release(sceneSource);
+
+	obs_data_set_string(response, "sourceType", sourceType);
+}
+
+void HandleOpenCameraSourceProperties(obs_data_t *request, obs_data_t *, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	if (!cameraId || !*cameraId)
+		return;
+
+	obs_canvas_t *canvas = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+		auto it = cameraCanvases.find(cameraId);
+		if (it == cameraCanvases.end())
+			return;
+		canvas = it->second;
+	}
+
+	obs_scene_t *scene = obs_canvas_get_scene_by_name(canvas, kCameraSceneName);
+	if (!scene)
+		return;
+
+	std::string sourceName = CameraSourceName(cameraId);
+	obs_sceneitem_t *item = obs_scene_find_source(scene, sourceName.c_str());
+	if (item)
+		obs_frontend_open_source_properties(obs_sceneitem_get_source(item));
+
+	obs_source_release(obs_scene_get_source(scene));
+}
+
+void HandleGetCameraSourceStatus(obs_data_t *request, obs_data_t *response, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	if (!cameraId || !*cameraId)
+		return;
+
+	obs_canvas_t *canvas = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+		auto it = cameraCanvases.find(cameraId);
+		if (it == cameraCanvases.end())
+			return;
+		canvas = it->second;
+	}
+
+	obs_scene_t *scene = obs_canvas_get_scene_by_name(canvas, kCameraSceneName);
+	if (!scene)
+		return;
+
+	std::string sourceName = CameraSourceName(cameraId);
+	obs_sceneitem_t *item = obs_scene_find_source(scene, sourceName.c_str());
+	if (item) {
+		const char *sourceId = obs_source_get_id(obs_sceneitem_get_source(item));
+		obs_data_set_bool(response, "attached", true);
+		if (strcmp(sourceId, kCameraCaptureSourceId) == 0)
+			obs_data_set_string(response, "sourceType", "camera");
+		else if (strcmp(sourceId, kScreenCaptureSourceId) == 0)
+			obs_data_set_string(response, "sourceType", "screen");
+	}
+
+	obs_source_release(obs_scene_get_source(scene));
+}
+
 // Per obs-websocket-api.h: "ALWAYS CALL ONLY VIA obs_module_post_load() CALLBACK!" — same
 // lifecycle CreateDock() already relies on, since obs-websocket's own obs_module_load()
 // (which sets up the proc handler this all rides on) is guaranteed to have run by then.
@@ -303,6 +452,9 @@ void RegisterVendorRequests()
 	obs_websocket_vendor_register_request(vendor, "CreateCameraCanvas", HandleCreateCameraCanvas, nullptr);
 	obs_websocket_vendor_register_request(vendor, "RemoveCameraCanvas", HandleRemoveCameraCanvas, nullptr);
 	obs_websocket_vendor_register_request(vendor, "GetCameraCanvasStatus", HandleGetCameraCanvasStatus, nullptr);
+	obs_websocket_vendor_register_request(vendor, "AttachCameraSource", HandleAttachCameraSource, nullptr);
+	obs_websocket_vendor_register_request(vendor, "OpenCameraSourceProperties", HandleOpenCameraSourceProperties, nullptr);
+	obs_websocket_vendor_register_request(vendor, "GetCameraSourceStatus", HandleGetCameraSourceStatus, nullptr);
 }
 
 } // namespace
