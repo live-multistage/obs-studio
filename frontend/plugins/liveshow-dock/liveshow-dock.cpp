@@ -230,6 +230,25 @@ std::string CameraSourceName(const std::string &cameraId)
 	return std::string(kCameraSourcePrefix) + cameraId;
 }
 
+bool CaptureFirstSceneItem(obs_scene_t *, obs_sceneitem_t *item, void *param)
+{
+	*static_cast<obs_sceneitem_t **>(param) = item;
+	return false; // stop after the first (and only) item
+}
+
+// The scene is only ever expected to hold exactly one item (the attached
+// capture source). Looking it up this way — rather than by the name passed
+// to obs_source_create() — is deliberate: on a rapid re-attach, OBS's own
+// name-dedup logic can silently rename the new source if the previous one's
+// deferred destroy (obs_source_destroy_defer) hasn't completed yet, which
+// would break a lookup keyed on the predicted name.
+obs_source_t *FindAttachedCaptureSource(obs_scene_t *scene)
+{
+	obs_sceneitem_t *item = nullptr;
+	obs_scene_enum_items(scene, CaptureFirstSceneItem, &item);
+	return item ? obs_sceneitem_get_source(item) : nullptr;
+}
+
 // See this plan's Global Constraints: obs_canvas_create() returns a canvas
 // with its weak-ref zero-initialized, and OBS's internal name/uuid lookup
 // tables store raw pointers with no addref — being findable by name does not
@@ -317,16 +336,17 @@ void HandleAttachCameraSource(obs_data_t *request, obs_data_t *response, void *)
 	else
 		return;
 
-	obs_canvas_t *canvas = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
-		auto it = cameraCanvases.find(cameraId);
-		if (it == cameraCanvases.end()) {
-			blog(LOG_WARNING, "[liveshow-dock] AttachCameraSource: no canvas for camera %s", cameraId);
-			return;
-		}
-		canvas = it->second;
+	// Held for the entire function body, not just the map lookup: obs-websocket
+	// dispatches vendor requests on a QThreadPool, so releasing the lock after
+	// copying out `canvas` would let a concurrent RemoveCameraCanvas destroy it
+	// out from under the obs_canvas_*/obs_source_* calls below.
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+	auto it = cameraCanvases.find(cameraId);
+	if (it == cameraCanvases.end()) {
+		blog(LOG_WARNING, "[liveshow-dock] AttachCameraSource: no canvas for camera %s", cameraId);
+		return;
 	}
+	obs_canvas_t *canvas = it->second;
 
 	// Replace whatever scene/source was previously attached, if any. Clearing
 	// the channel first releases the channel's own held ref (confirmed in
@@ -372,23 +392,20 @@ void HandleOpenCameraSourceProperties(obs_data_t *request, obs_data_t *, void *)
 	if (!cameraId || !*cameraId)
 		return;
 
-	obs_canvas_t *canvas = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
-		auto it = cameraCanvases.find(cameraId);
-		if (it == cameraCanvases.end())
-			return;
-		canvas = it->second;
-	}
+	// Held for the entire function body — see HandleAttachCameraSource for why.
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+	auto it = cameraCanvases.find(cameraId);
+	if (it == cameraCanvases.end())
+		return;
+	obs_canvas_t *canvas = it->second;
 
 	obs_scene_t *scene = obs_canvas_get_scene_by_name(canvas, kCameraSceneName);
 	if (!scene)
 		return;
 
-	std::string sourceName = CameraSourceName(cameraId);
-	obs_sceneitem_t *item = obs_scene_find_source(scene, sourceName.c_str());
-	if (item)
-		obs_frontend_open_source_properties(obs_sceneitem_get_source(item));
+	obs_source_t *source = FindAttachedCaptureSource(scene);
+	if (source)
+		obs_frontend_open_source_properties(source);
 
 	obs_source_release(obs_scene_get_source(scene));
 }
@@ -399,23 +416,20 @@ void HandleGetCameraSourceStatus(obs_data_t *request, obs_data_t *response, void
 	if (!cameraId || !*cameraId)
 		return;
 
-	obs_canvas_t *canvas = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
-		auto it = cameraCanvases.find(cameraId);
-		if (it == cameraCanvases.end())
-			return;
-		canvas = it->second;
-	}
+	// Held for the entire function body — see HandleAttachCameraSource for why.
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+	auto it = cameraCanvases.find(cameraId);
+	if (it == cameraCanvases.end())
+		return;
+	obs_canvas_t *canvas = it->second;
 
 	obs_scene_t *scene = obs_canvas_get_scene_by_name(canvas, kCameraSceneName);
 	if (!scene)
 		return;
 
-	std::string sourceName = CameraSourceName(cameraId);
-	obs_sceneitem_t *item = obs_scene_find_source(scene, sourceName.c_str());
-	if (item) {
-		const char *sourceId = obs_source_get_id(obs_sceneitem_get_source(item));
+	obs_source_t *source = FindAttachedCaptureSource(scene);
+	if (source) {
+		const char *sourceId = obs_source_get_id(source);
 		obs_data_set_bool(response, "attached", true);
 		if (strcmp(sourceId, kCameraCaptureSourceId) == 0)
 			obs_data_set_string(response, "sourceType", "camera");
