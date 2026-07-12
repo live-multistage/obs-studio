@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 
 OBS_DECLARE_MODULE()
@@ -29,6 +30,7 @@ constexpr const char *kCameraCanvasNamePrefix = "liveshow-camera-";
 QCefWidget *dockWidget = nullptr;
 obs_websocket_vendor vendor = nullptr;
 std::map<std::string, obs_canvas_t *> cameraCanvases;
+std::mutex cameraCanvasesMutex;
 
 std::string EnvOrDefault(const char *name, const char *fallback)
 {
@@ -220,6 +222,8 @@ void HandleCreateCameraCanvas(obs_data_t *request, obs_data_t *response, void *)
 	if (!cameraId || !*cameraId)
 		return;
 
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+
 	std::string id(cameraId);
 	auto it = cameraCanvases.find(id);
 	if (it != cameraCanvases.end()) {
@@ -250,6 +254,8 @@ void HandleRemoveCameraCanvas(obs_data_t *request, obs_data_t *, void *)
 	if (!cameraId || !*cameraId)
 		return;
 
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+
 	auto it = cameraCanvases.find(cameraId);
 	if (it == cameraCanvases.end())
 		return;
@@ -265,6 +271,8 @@ void HandleRemoveCameraCanvas(obs_data_t *request, obs_data_t *, void *)
 void HandleGetCameraCanvasStatus(obs_data_t *request, obs_data_t *response, void *)
 {
 	const char *cameraId = obs_data_get_string(request, "cameraId");
+
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
 	bool exists = cameraId && *cameraId && cameraCanvases.count(cameraId) > 0;
 	obs_data_set_bool(response, "exists", exists);
 }
