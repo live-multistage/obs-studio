@@ -47,6 +47,18 @@ obs_websocket_vendor vendor = nullptr;
 std::map<std::string, obs_canvas_t *> cameraCanvases;
 std::mutex cameraCanvasesMutex;
 
+struct CameraOutput {
+	obs_output_t *output;
+	obs_encoder_t *videoEncoder;
+	obs_encoder_t *audioEncoder;
+	obs_service_t *service;
+};
+
+// Guarded by cameraCanvasesMutex (not a second mutex) — StartCameraOutput needs
+// to read cameraCanvases and write cameraOutputs in the same critical section,
+// and reusing the one existing lock avoids any two-mutex lock-ordering risk.
+std::map<std::string, CameraOutput> cameraOutputs;
+
 std::string EnvOrDefault(const char *name, const char *fallback)
 {
 	const char *value = std::getenv(name);
@@ -228,6 +240,11 @@ std::string CameraCanvasName(const std::string &cameraId)
 std::string CameraSourceName(const std::string &cameraId)
 {
 	return std::string(kCameraSourcePrefix) + cameraId;
+}
+
+std::string CameraOutputName(const std::string &cameraId)
+{
+	return std::string("liveshow-output-") + cameraId;
 }
 
 bool CaptureFirstSceneItem(obs_scene_t *, obs_sceneitem_t *item, void *param)
@@ -440,6 +457,140 @@ void HandleGetCameraSourceStatus(obs_data_t *request, obs_data_t *response, void
 	obs_source_release(obs_scene_get_source(scene));
 }
 
+// Ref-counting note: obs_output_create()/obs_video_encoder_create()/
+// obs_audio_encoder_create()/obs_service_create() all zero-init their ref
+// exactly like Phase 1's bare canvas — none of these four objects are ever
+// added to an addrefing container (unlike Phase 2's sources, which scenes
+// addref), so the plugin is the sole owner of all four and must hold and
+// release all four itself.
+void HandleStartCameraOutput(obs_data_t *request, obs_data_t *response, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	const char *url = obs_data_get_string(request, "url");
+	const char *streamId = obs_data_get_string(request, "streamId");
+	const char *streamKey = obs_data_get_string(request, "streamKey");
+	if (!cameraId || !*cameraId || !url || !*url || !streamId || !*streamId)
+		return;
+
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+
+	if (cameraOutputs.count(cameraId) > 0) {
+		obs_data_set_bool(response, "active", true);
+		return;
+	}
+
+	auto canvasIt = cameraCanvases.find(cameraId);
+	if (canvasIt == cameraCanvases.end()) {
+		blog(LOG_WARNING, "[liveshow-dock] StartCameraOutput: no canvas for camera %s", cameraId);
+		return;
+	}
+	obs_canvas_t *canvas = canvasIt->second;
+
+	std::string baseName = CameraOutputName(cameraId);
+
+	obs_data_t *videoSettings = obs_data_create();
+	obs_data_set_int(videoSettings, "bitrate", 4000);
+	std::string videoEncoderName = baseName + "-video";
+	obs_encoder_t *videoEncoder = obs_video_encoder_create("obs_x264", videoEncoderName.c_str(), videoSettings, nullptr);
+	obs_data_release(videoSettings);
+	if (!videoEncoder) {
+		blog(LOG_WARNING, "[liveshow-dock] StartCameraOutput: video encoder create failed for camera %s", cameraId);
+		return;
+	}
+	obs_encoder_set_video(videoEncoder, obs_canvas_get_video(canvas));
+
+	obs_data_t *audioSettings = obs_data_create();
+	obs_data_set_int(audioSettings, "bitrate", 128);
+	std::string audioEncoderName = baseName + "-audio";
+	obs_encoder_t *audioEncoder = obs_audio_encoder_create("ffmpeg_aac", audioEncoderName.c_str(), audioSettings, 0, nullptr);
+	obs_data_release(audioSettings);
+	if (!audioEncoder) {
+		blog(LOG_WARNING, "[liveshow-dock] StartCameraOutput: audio encoder create failed for camera %s", cameraId);
+		obs_encoder_release(videoEncoder);
+		return;
+	}
+	obs_encoder_set_audio(audioEncoder, obs_get_audio());
+
+	obs_data_t *serviceSettings = obs_data_create();
+	obs_data_set_string(serviceSettings, "server", url);
+	obs_data_set_string(serviceSettings, "key", streamId);
+	obs_data_set_string(serviceSettings, "password", streamKey);
+	std::string serviceName = baseName + "-service";
+	obs_service_t *service = obs_service_create("rtmp_custom", serviceName.c_str(), serviceSettings, nullptr);
+	obs_data_release(serviceSettings);
+	if (!service) {
+		blog(LOG_WARNING, "[liveshow-dock] StartCameraOutput: service create failed for camera %s", cameraId);
+		obs_encoder_release(videoEncoder);
+		obs_encoder_release(audioEncoder);
+		return;
+	}
+
+	std::string outputName = baseName + "-output";
+	obs_output_t *output = obs_output_create("ffmpeg_mpegts_muxer", outputName.c_str(), nullptr, nullptr);
+	if (!output) {
+		blog(LOG_WARNING, "[liveshow-dock] StartCameraOutput: output create failed for camera %s", cameraId);
+		obs_encoder_release(videoEncoder);
+		obs_encoder_release(audioEncoder);
+		obs_service_release(service);
+		return;
+	}
+
+	obs_output_set_video_encoder(output, videoEncoder);
+	obs_output_set_audio_encoder(output, audioEncoder, 0);
+	obs_output_set_service(output, service);
+
+	if (!obs_output_start(output)) {
+		const char *err = obs_output_get_last_error(output);
+		blog(LOG_WARNING, "[liveshow-dock] StartCameraOutput: obs_output_start failed for camera %s: %s", cameraId,
+		     (err && *err) ? err : "(no error message)");
+		if (err && *err)
+			obs_data_set_string(response, "error", err);
+		obs_output_release(output);
+		obs_encoder_release(videoEncoder);
+		obs_encoder_release(audioEncoder);
+		obs_service_release(service);
+		return;
+	}
+
+	cameraOutputs[cameraId] = CameraOutput{output, videoEncoder, audioEncoder, service};
+	obs_data_set_bool(response, "active", true);
+}
+
+void HandleStopCameraOutput(obs_data_t *request, obs_data_t *, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	if (!cameraId || !*cameraId)
+		return;
+
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+
+	auto it = cameraOutputs.find(cameraId);
+	if (it == cameraOutputs.end())
+		return;
+
+	// obs_output_stop()'s type-specific teardown (output->info.stop, invoked from
+	// obs_output_actual_stop) runs synchronously within this call — confirmed by
+	// reading obs-output.c directly. Releasing our held refs right after matches
+	// the same lifecycle sequence OBS's own frontend uses for any output.
+	obs_output_stop(it->second.output);
+	obs_output_release(it->second.output);
+	obs_encoder_release(it->second.videoEncoder);
+	obs_encoder_release(it->second.audioEncoder);
+	obs_service_release(it->second.service);
+	cameraOutputs.erase(it);
+}
+
+void HandleGetCameraOutputStatus(obs_data_t *request, obs_data_t *response, void *)
+{
+	const char *cameraId = obs_data_get_string(request, "cameraId");
+	if (!cameraId || !*cameraId)
+		return;
+
+	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
+	auto it = cameraOutputs.find(cameraId);
+	obs_data_set_bool(response, "active", it != cameraOutputs.end() && obs_output_active(it->second.output));
+}
+
 // Per obs-websocket-api.h: "ALWAYS CALL ONLY VIA obs_module_post_load() CALLBACK!" — same
 // lifecycle CreateDock() already relies on, since obs-websocket's own obs_module_load()
 // (which sets up the proc handler this all rides on) is guaranteed to have run by then.
@@ -469,6 +620,9 @@ void RegisterVendorRequests()
 	obs_websocket_vendor_register_request(vendor, "AttachCameraSource", HandleAttachCameraSource, nullptr);
 	obs_websocket_vendor_register_request(vendor, "OpenCameraSourceProperties", HandleOpenCameraSourceProperties, nullptr);
 	obs_websocket_vendor_register_request(vendor, "GetCameraSourceStatus", HandleGetCameraSourceStatus, nullptr);
+	obs_websocket_vendor_register_request(vendor, "StartCameraOutput", HandleStartCameraOutput, nullptr);
+	obs_websocket_vendor_register_request(vendor, "StopCameraOutput", HandleStopCameraOutput, nullptr);
+	obs_websocket_vendor_register_request(vendor, "GetCameraOutputStatus", HandleGetCameraOutputStatus, nullptr);
 }
 
 } // namespace
