@@ -474,9 +474,23 @@ void HandleStartCameraOutput(obs_data_t *request, obs_data_t *response, void *)
 
 	std::lock_guard<std::mutex> lock(cameraCanvasesMutex);
 
-	if (cameraOutputs.count(cameraId) > 0) {
-		obs_data_set_bool(response, "active", true);
-		return;
+	// A present map entry alone isn't proof the output is still alive — SRT
+	// connection failures happen asynchronously (confirmed via live testing:
+	// obs_output_start() can return true and then the connection dies ~3s
+	// later on its own), and the async failure path doesn't clean up
+	// cameraOutputs itself. Check obs_output_active() before trusting the
+	// entry; if it's actually dead, release it and fall through to retry.
+	auto existingIt = cameraOutputs.find(cameraId);
+	if (existingIt != cameraOutputs.end()) {
+		if (obs_output_active(existingIt->second.output)) {
+			obs_data_set_bool(response, "active", true);
+			return;
+		}
+		obs_output_release(existingIt->second.output);
+		obs_encoder_release(existingIt->second.videoEncoder);
+		obs_encoder_release(existingIt->second.audioEncoder);
+		obs_service_release(existingIt->second.service);
+		cameraOutputs.erase(existingIt);
 	}
 
 	auto canvasIt = cameraCanvases.find(cameraId);
